@@ -1,0 +1,277 @@
+# phishing_pipeline/shortlisting.py
+import os
+import pandas as pd
+import logging
+import tldextract
+from rapidfuzz import fuzz
+import jellyfish
+import unicodedata
+import glob
+import sys
+import re
+ 
+# Attempt relative config import (like your original)
+try:
+    from .config import ROOT_DIR
+except Exception:
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    from phishing_pipeline.config import ROOT_DIR
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# Defaults (used when caller doesn't provide explicit paths)
+DEFAULT_holdout_folder = os.path.join(ROOT_DIR, "PS-02_hold-out_Set_2")
+DEFAULT_TARGET_URLS_FILE = os.path.join(ROOT_DIR, "target_urls.txt")
+DEFAULT_WHITELIST_FILE = os.path.join(ROOT_DIR, "uploads", "PS-02_hold-out_Set1_Legitimate_Domains_for_10_CSEs.xlsx")
+DEFAULT_MERGED_TARGET_FILE = os.path.join(ROOT_DIR, "merge.txt")
+DEFAULT_FOUND_FILE = os.path.join(ROOT_DIR, "found.txt")
+DEFAULT_OUTPUT_FILE = os.path.join(ROOT_DIR, "holdout.csv")
+
+GENERIC_DOMAIN_PARTS = {
+    'com', 'in', 'gov', 'org', 'co', 'net', 'www', 'io', 'xyz', 'app', 'site',
+    'online', 'shop', 'store', 'info', 'live', 'club', 'dev', 'io', 'ai'
+}
+GENERIC_PRIMARY_DOMAINS = {'mail', 'email', 'gov', 'nic'}
+HOMOGLYPHS = {
+    "а": "a", "ο": "o", "е": "e", "і": "i", "ѕ": "s", "р": "p", "с": "c", "υ": "u", "ν": "v",
+    "０": "0", "１": "1", "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+    "Ａ": "A", "Ｂ": "B", "Ｃ": "C", "Ｄ": "D", "Ｅ": "E", "Ｆ": "F", "Ｇ": "G",
+    "Ｈ": "H", "Ｉ": "I", "Ｊ": "J", "Ｋ": "K", "Ｌ": "L", "Ｍ": "M", "Ｎ": "N",
+    "Ｏ": "O", "Ｐ": "P", "Ｑ": "Q", "Ｒ": "R", "Ｓ": "S", "Ｔ": "T", "Ｕ": "U",
+    "Ｖ": "V", "Ｗ": "W", "Ｘ": "X", "Ｙ": "Y", "Ｚ": "Z",
+    "1": "l", "0": "o", "3": "e", "5": "s", "@": "a"
+}
+
+def normalize_url(url: str) -> str:
+    if not url:
+        return ""
+    url = str(url).strip().lower()
+    if not re.match(r"^https?://", url):
+        url = "https://" + url
+    url = "".join(HOMOGLYPHS.get(ch, ch) for ch in unicodedata.normalize("NFKC", url))
+    return url
+
+def get_clean_parts(url: str) -> set:
+    try:
+        ext = tldextract.extract(url)
+        subdomain_parts = set(ext.subdomain.split('.')) if ext.subdomain else set()
+        domain_part = {ext.domain} if ext.domain else set()
+        all_parts = subdomain_parts.union(domain_part)
+        clean_parts = {
+            part for part in all_parts
+            if part not in GENERIC_DOMAIN_PARTS and len(part) > 2
+        }
+        return clean_parts
+    except Exception:
+        return set()
+
+def get_primary_part(url: str) -> str:
+    try:
+        return tldextract.extract(url).domain
+    except Exception:
+        return ""
+
+def is_similar_advanced(cand_url_norm: str, legit_url_norm: str,
+                        cand_primary: str, legit_primary: str, legit_parts: set) -> bool:
+    if not cand_primary or not legit_primary:
+        return False
+    if cand_url_norm == legit_url_norm:
+        return False
+    try:
+        if jellyfish.jaro_winkler_similarity(cand_primary, legit_primary) >= 0.85:
+            return True
+    except Exception:
+        pass
+    try:
+        if fuzz.token_set_ratio(cand_primary, legit_primary) >= 90:
+            return True
+    except Exception:
+        pass
+    return False
+
+def load_urls_from_excel_folder(folder_path):
+    logger.info(f"Reading Excel files from: {folder_path}")
+    all_urls = set()
+    excel_files = glob.glob(os.path.join(folder_path, "*.xlsx"))
+    if not excel_files:
+        logger.warning(f"No .xlsx files found in {folder_path}.")
+        return all_urls
+    logger.info(f"Found {len(excel_files)} files.")
+    for file in excel_files:
+        try:
+            df = pd.read_excel(file)
+            possible_cols = ["Identified Phishing/Suspected Domain Name", "URL", "url", "Domain", "domain_name"]
+            found_col = None
+            for col in possible_cols:
+                if col in df.columns:
+                    found_col = col
+                    break
+            if not found_col:
+                for col in df.columns:
+                    if "url" in str(col).lower() or "domain" in str(col).lower():
+                        found_col = col
+                        break
+            if not found_col:
+                found_col = df.columns[0]
+                logger.warning(f"No known URL column in {file}. Using first column: {found_col}")
+            urls = df[found_col].dropna().astype(str)
+            all_urls.update(url.strip().lower() for url in urls)
+            logger.info(f"Loaded {len(urls)} URLs from '{file}'")
+        except Exception as e:
+            logger.error(f"Failed to read {file}: {e}")
+    return all_urls
+
+def load_urls_from_txt(file_path):
+    if not os.path.exists(file_path):
+        logger.warning(f"File not found: {file_path}")
+        return set()
+    with open(file_path, "r", encoding="utf-8") as f:
+        urls = {line.strip().lower() for line in f if line.strip()}
+    if urls:
+        logger.info(f"Loaded {len(urls)} URLs from {file_path}")
+    return urls
+
+def write_list_to_txt(url_list, output_file):
+    with open(output_file, "w", encoding="utf-8") as f:
+        for url in sorted(url_list):
+            f.write(f"{url}\n")
+    logger.info(f"Saved {len(url_list)} URLs to {output_file}")
+
+def run_shortlisting_process(holdout_folder: str | None = None,
+                             target_urls_file: str | None = None,
+                             whitelist_file: str | None = None,
+                             merged_target_file: str | None = None,
+                             found_file: str | None = None,
+                             output_file: str | None = None,
+                             limit_whitelisted: int | None = None,
+                             write_outputs: bool = True) -> pd.DataFrame:
+    """
+    Run the shortlisting process and return a pandas DataFrame of matches.
+
+    Parameters allow callers (e.g., main_controller.py) to pass custom paths.
+    """
+    holdout_folder = holdout_folder or DEFAULT_holdout_folder
+    target_urls_file = target_urls_file or DEFAULT_TARGET_URLS_FILE
+    whitelist_file = whitelist_file or DEFAULT_WHITELIST_FILE
+    merged_target_file = merged_target_file or DEFAULT_MERGED_TARGET_FILE
+    found_file = found_file or DEFAULT_FOUND_FILE
+    output_file = output_file or DEFAULT_OUTPUT_FILE
+
+    logger.info("--- Step 1: Combine URL sources ---")
+    excel_urls = load_urls_from_excel_folder(holdout_folder)
+    txt_urls = load_urls_from_txt(target_urls_file)
+    master_urls = excel_urls.union(txt_urls)
+    logger.info(f"Total {len(master_urls)} unique URLs in the master list.")
+    if write_outputs:
+        write_list_to_txt(master_urls, merged_target_file)
+
+    logger.info("--- Step 3: Find duplicates (found.txt) ---")
+    found_urls = excel_urls.intersection(txt_urls)
+    logger.info(f"Found {len(found_urls)} URLs that are in BOTH sources.")
+    if write_outputs:
+        write_list_to_txt(found_urls, found_file)
+
+    logger.info("--- Step 2: Find similar domains (holdout.csv) ---")
+    try:
+        wl_df = pd.read_excel(whitelist_file)
+        # Normalize column names if necessary
+        wl_df.rename(columns={
+            "Cooresponding CSE": "Cooresponding CSE",
+            "Legitimate Domains": "Legitimate Domains"
+        }, inplace=True)
+        if "Cooresponding CSE" not in wl_df.columns or "Legitimate Domains" not in wl_df.columns:
+            logger.error("Whitelist file must contain 'Cooresponding CSE' and 'Legitimate Domains' columns.")
+            return pd.DataFrame()
+        wl_df["Cooresponding CSE"] = wl_df["Cooresponding CSE"].ffill()
+        if limit_whitelisted:
+            wl_df = wl_df.head(limit_whitelisted)
+    except FileNotFoundError:
+        logger.error(f"Whitelist file not found at {whitelist_file}.")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Error reading whitelist file {whitelist_file}: {e}")
+        return pd.DataFrame()
+
+    whitelist_processed = []
+    for _, row in wl_df.iterrows():
+        org = str(row["Cooresponding CSE"]).strip()
+        dom = str(row["Legitimate Domains"]).strip().lower()
+        if not dom or dom == "nan":
+            continue
+        normalized_url = normalize_url(dom)
+        legit_primary = get_primary_part(normalized_url)
+        if legit_primary in GENERIC_PRIMARY_DOMAINS:
+            logger.warning(f"Ignoring generic whitelist domain: {dom}")
+            continue
+        whitelist_processed.append({
+            "url": dom,
+            "org": org,
+            "norm_url": normalized_url,
+            "parts": get_clean_parts(normalized_url),
+            "primary": legit_primary
+        })
+
+    logger.info("Loaded and pre-processed %d whitelisted domains.", len(whitelist_processed))
+
+    candidates_processed = []
+    for url in master_urls:
+        normalized_url = normalize_url(url)
+        candidates_processed.append({
+            "url": url,
+            "norm_url": normalized_url,
+            "primary": get_primary_part(normalized_url)
+        })
+
+    all_rows, seen = [], set()
+    logger.info("Starting advanced matching... (Candidates: %d, Whitelist: %d)", len(candidates_processed), len(whitelist_processed))
+
+    for cand in candidates_processed:
+        if cand["url"] in seen:
+            continue
+        for legit in whitelist_processed:
+            if is_similar_advanced(
+                cand["norm_url"], legit["norm_url"],
+                cand["primary"], legit["primary"], legit["parts"]
+            ):
+                key = (legit["org"], legit["url"], cand["url"])
+                if key not in seen:
+                    seen.add(key)
+                    all_rows.append({
+                        "Cooresponding CSE": legit["org"],
+                        "Legitimate Domains": legit["url"],
+                        "Identified Phishing/Suspected Domain Name": cand["url"]
+                    })
+                break
+
+    out_df = pd.DataFrame(all_rows).drop_duplicates()
+    if write_outputs and not out_df.empty:
+        out_df.to_csv(output_file, index=False, encoding="utf-8")
+        logger.info("Shortlisted domains saved to %s with %d rows.", output_file, len(out_df))
+    elif out_df.empty:
+        logger.warning("No similar domains were found. Output DataFrame is empty.")
+
+    logger.info("--- Shortlisting process complete ---")
+    return out_df
+
+# ----------------------------------------------------------------------
+# BACKWARD COMPATIBILITY WRAPPER FOR pipeline.py
+# ----------------------------------------------------------------------
+def generate_shortlisted_csv(holdout_folder, ps02_whitelist_file,
+                             limit_whitelisted=None, write_outputs=True):
+    """
+    Wrapper to keep pipeline.py working.
+    Calls run_shortlisting_process() and returns the output CSV path.
+    """
+    out_df = run_shortlisting_process(
+        holdout_folder=holdout_folder,
+        whitelist_file=ps02_whitelist_file,
+        limit_whitelisted=limit_whitelisted,
+        write_outputs=write_outputs
+    )
+    return os.path.abspath(DEFAULT_OUTPUT_FILE)  # path to holdout.csv
